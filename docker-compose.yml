@@ -1,0 +1,78 @@
+# Maple local mode — Dokploy Compose deployment.
+#
+# Setup in Dokploy:
+#   1. Create a project -> "Compose" service, point it at this repo.
+#   2. Compose Path: ./docker-compose.dokploy.yml
+#   3. Environment tab:  MAPLE_DOMAIN=maple.yourdomain.com
+#   4. Domains tab: Add Domain -> host maple.yourdomain.com, container port 4318,
+#      HTTPS on, Let's Encrypt. Dokploy injects the Traefik labels itself.
+#   5. Deploy.
+#
+# MAPLE_DOMAIN must match the domain you add in step 4 exactly. Maple pins an
+# origin allowlist to its advertised host; if they disagree the dashboard loads
+# but every API call it makes comes back 403.
+
+services:
+    maple:
+        build:
+            context: .
+            dockerfile: Dockerfile
+            args:
+                MAPLE_VERSION: ${MAPLE_VERSION:-v0.0.18}
+
+        restart: unless-stopped
+
+        # maple is PID 1 here; an init reaps children and passes SIGTERM through
+        # so chDB closes cleanly rather than leaving a dirty store behind.
+        init: true
+        stop_grace_period: 30s
+
+        # No `ports:` — Traefik reaches this over dokploy-network. Publishing on
+        # the host would bypass the proxy (and whatever auth you put on it).
+        expose:
+            - "4318"
+
+        volumes:
+            - maple-data:/var/lib/maple
+
+        environment:
+            MAPLE_NO_UPDATE_CHECK: "1"
+
+        command:
+            - maple
+            - start
+            - --offline
+            - --host
+            - 0.0.0.0
+            - --port
+            - "4318"
+            # Subdirectory, not the volume root: maple writes its maintenance
+            # lock as a *sibling* of the data dir, so the parent must be writable.
+            - --data-dir
+            - /var/lib/maple/data
+            # Load-bearing. Without it Maple's browser-origin allowlist is only
+            # {0.0.0.0, 127.0.0.1} and the dashboard 403s behind any domain.
+            - --advertise-host
+            - ${MAPLE_DOMAIN:?set MAPLE_DOMAIN in the Dokploy Environment tab}
+            # Survive an unclean stop (OOM kill, node reboot) instead of crash-looping.
+            - --on-dirty-store
+            - restore-checkpoint
+
+        healthcheck:
+            test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4318/health"]
+            interval: 15s
+            timeout: 5s
+            start_period: 30s
+            retries: 3
+
+        networks:
+            - dokploy-network
+
+networks:
+    dokploy-network:
+        external: true
+
+volumes:
+    # A named volume, not a ../files bind mount — Dokploy's Volume Backups only
+    # work with named volumes.
+    maple-data:
